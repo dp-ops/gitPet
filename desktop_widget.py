@@ -1,27 +1,23 @@
 import sys
+import os
 import threading
 import msvcrt
 from PyQt6.QtCore import Qt, QTimer, QPoint, QSettings, pyqtSignal, QObject
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, 
-    QLabel, QProgressBar, QPushButton, QFrame, QMenu
+    QLabel, QPushButton, QFrame, QMenu
 )
-from PyQt6.QtGui import QAction, QKeyEvent
+from PyQt6.QtGui import QAction, QKeyEvent, QPixmap
 import psutil
 
 class TerminalListener(QObject):
     quit_signal = pyqtSignal()
-
     def start(self):
-        thread = threading.Thread(target=self._run, daemon=True)
-        thread.start()
-
+        threading.Thread(target=self._run, daemon=True).start()
     def _run(self):
-        print("Terminal listener active: Press 'q' in this terminal to close the widget.")
+        print("Press 'q' in this terminal to close the widget.")
         while True:
-            char = msvcrt.getch().decode('utf-8', errors='ignore').lower()
-            if char == 'q':
-                print("\n'q' received. Shutting down...")
+            if msvcrt.getch().decode('utf-8', errors='ignore').lower() == 'q':
                 self.quit_signal.emit()
                 break
 
@@ -29,35 +25,45 @@ class DesktopMonitorWidget(QWidget):
     def __init__(self):
         super().__init__()
 
-        # --- 1. Desktop Pinning & Window Flags ---
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint |
-            Qt.WindowType.WindowStaysOnBottomHint |  # Sits behind all normal apps
-            Qt.WindowType.SubWindow                 # Merges into desktop layer
+            Qt.WindowType.WindowStaysOnBottomHint |
+            Qt.WindowType.SubWindow
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.customContextMenuRequested.connect(self.show_context_menu)
 
-        self.setFixedSize(260, 160)
+        # Make the widget taller and narrower to focus on the image
+        self.setFixedSize(220, 260)
         self._drag_pos = QPoint()
 
-        # --- 2. Persistent Settings (Coordinates & Lock State) ---
-        # Stored automatically in Windows Registry under:
-        # HKEY_CURRENT_USER\Software\DesktopMonitor\Settings
         self.settings = QSettings("DesktopMonitor", "Settings")
         self.is_locked = self.settings.value("locked", False, type=bool)
+
+        # --- Image Animation Logic State ---
+        self.low_images = ["png/Sleepping/pose_1.png", "png/Sleepping/pose_2.png", "png/Sleepping/pose_4.png"]
+        self.high_image = "png/other/pose_3.png"
+        self.current_frame = 0
+        self.is_high_load = False
 
         self._restore_position()
         self._init_ui()
 
-        # Update metrics every 1 second
-        self.timer = QTimer(self)
-        self.timer.timeout.connect(self.update_metrics)
-        self.timer.start(1000)
+        # Timer 1: Hardware Metrics (every 1 second)
+        self.metric_timer = QTimer(self)
+        self.metric_timer.timeout.connect(self.update_metrics)
+        self.metric_timer.start(1000)
+
+        # Timer 2: Image Rotation (every 1.5 seconds)
+        self.anim_timer = QTimer(self)
+        self.anim_timer.timeout.connect(self.rotate_image)
+        self.anim_timer.start(1500)
+
+        # Force initial image load
+        self.update_image_display()
 
     def _restore_position(self):
-        # Default to (100, 100) if no prior coordinates exist
         saved_pos = self.settings.value("pos", QPoint(100, 100))
         self.move(saved_pos)
 
@@ -68,57 +74,36 @@ class DesktopMonitorWidget(QWidget):
         card = QFrame()
         card.setObjectName("card")
         card_layout = QVBoxLayout(card)
-        card_layout.setContentsMargins(16, 12, 16, 14)
-        card_layout.setSpacing(10)
+        card_layout.setContentsMargins(12, 12, 12, 12)
+        card_layout.setSpacing(8)
 
-        # Header
+        # Header (Close Button Only)
         header_layout = QHBoxLayout()
-        title_label = QLabel("SYSTEM MONITOR")
-        title_label.setObjectName("title")
-
+        header_layout.addStretch()
         close_btn = QPushButton("✕")
         close_btn.setObjectName("close_btn")
         close_btn.setFixedSize(18, 18)
         close_btn.clicked.connect(self.close)
-
-        header_layout.addWidget(title_label)
-        header_layout.addStretch()
         header_layout.addWidget(close_btn)
         card_layout.addLayout(header_layout)
 
-        # CPU Row
-        cpu_header = QHBoxLayout()
-        cpu_title = QLabel("CPU")
-        self.cpu_val = QLabel("0%")
-        cpu_title.setObjectName("metric_label")
+        # Central Image Viewer
+        self.image_label = QLabel("No Image")
+        self.image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.image_label.setObjectName("image_label")
+        card_layout.addWidget(self.image_label, stretch=1)
+
+        # Minimal Footer Metrics
+        metrics_layout = QHBoxLayout()
+        self.cpu_val = QLabel("CPU: --%")
+        self.ram_val = QLabel("RAM: --%")
         self.cpu_val.setObjectName("metric_val")
-        cpu_header.addWidget(cpu_title)
-        cpu_header.addStretch()
-        cpu_header.addWidget(self.cpu_val)
-        card_layout.addLayout(cpu_header)
-
-        self.cpu_bar = QProgressBar()
-        self.cpu_bar.setObjectName("cpu_bar")
-        self.cpu_bar.setTextVisible(False)
-        self.cpu_bar.setRange(0, 100)
-        card_layout.addWidget(self.cpu_bar)
-
-        # RAM Row
-        ram_header = QHBoxLayout()
-        ram_title = QLabel("RAM")
-        self.ram_val = QLabel("0%")
-        ram_title.setObjectName("metric_label")
         self.ram_val.setObjectName("metric_val")
-        ram_header.addWidget(ram_title)
-        ram_header.addStretch()
-        ram_header.addWidget(self.ram_val)
-        card_layout.addLayout(ram_header)
-
-        self.ram_bar = QProgressBar()
-        self.ram_bar.setObjectName("ram_bar")
-        self.ram_bar.setTextVisible(False)
-        self.ram_bar.setRange(0, 100)
-        card_layout.addWidget(self.ram_bar)
+        
+        metrics_layout.addWidget(self.cpu_val)
+        metrics_layout.addStretch()
+        metrics_layout.addWidget(self.ram_val)
+        card_layout.addLayout(metrics_layout)
 
         main_layout.addWidget(card)
 
@@ -128,52 +113,81 @@ class DesktopMonitorWidget(QWidget):
                 border: 1px solid rgba(255, 255, 255, 30);
                 border-radius: 12px;
             }
-            #title {
-                color: #9ca3af;
-                font-size: 10px;
-                font-weight: 700;
-                letter-spacing: 1px;
-            }
             #close_btn {
-                background: transparent;
+                background: transparent; color: #6b7280; border: none; font-size: 11px; font-weight: bold;
+            }
+            #close_btn:hover { color: #ef4444; }
+            #image_label {
+                background-color: rgba(0, 0, 0, 40);
+                border-radius: 8px;
                 color: #6b7280;
-                border: none;
-                font-size: 11px;
-                font-weight: bold;
             }
-            #close_btn:hover {
-                color: #ef4444;
-            }
-            #metric_label, #metric_val {
-                color: #f3f4f6;
-                font-size: 11px;
-                font-weight: 600;
-            }
-            QProgressBar {
-                background-color: rgba(255, 255, 255, 20);
-                border: none;
-                border-radius: 4px;
-                height: 6px;
-            }
-            #cpu_bar::chunk {
-                background-color: #3b82f6;
-                border-radius: 4px;
-            }
-            #ram_bar::chunk {
-                background-color: #10b981;
-                border-radius: 4px;
+            #metric_val {
+                color: #9ca3af; font-size: 11px; font-weight: 600;
             }
         """)
 
     def update_metrics(self):
         cpu = psutil.cpu_percent(interval=None)
         ram = psutil.virtual_memory().percent
-        self.cpu_bar.setValue(int(cpu))
-        self.cpu_val.setText(f"{cpu:.1f}%")
-        self.ram_bar.setValue(int(ram))
-        self.ram_val.setText(f"{ram:.1f}%")
+        
+        self.cpu_val.setText(f"CPU: {cpu:.0f}%")
+        self.ram_val.setText(f"RAM: {ram:.0f}%")
 
-    # --- Mouse Dragging & Persistent Coordinate Saving ---
+        # Determine state
+        if cpu >= 30.0 and not self.is_high_load:
+            self.is_high_load = True
+            self.update_image_display()
+        elif cpu < 30.0 and self.is_high_load:
+            self.is_high_load = False
+            self.current_frame = 0
+            self.update_image_display()
+
+    def rotate_image(self):
+        # Only rotate if we are in the low load state
+        if not self.is_high_load:
+            self.current_frame = (self.current_frame + 1) % len(self.low_images)
+            self.update_image_display()
+
+    # def update_image_display(self):
+    #     image_name = self.high_image if self.is_high_load else self.low_images[self.current_frame]
+        
+    #     # Load and scale the image to fit the container while maintaining aspect ratio
+    #     if os.path.exists(image_name):
+    #         pixmap = QPixmap(image_name)
+    #         # Scale to fit exactly within 180x180 pixels maximum
+    #         scaled_pixmap = pixmap.scaled(
+    #             180, 180, 
+    #             Qt.AspectRatioMode.KeepAspectRatio, 
+    #             Qt.TransformationMode.SmoothTransformation
+    #         )
+    #         self.image_label.setPixmap(scaled_pixmap)
+    #     else:
+    #         self.image_label.setText(f"Missing\n{image_name}")
+
+    def update_image_display(self):
+        # 1. Get the relative image name based on CPU state
+        image_name = self.high_image if self.is_high_load else self.low_images[self.current_frame]
+        
+        # 2. Get the absolute path to the directory where this script lives
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        
+        # 3. Combine them to get the absolute path to the image
+        full_image_path = os.path.join(script_dir, image_name)
+        
+        # 4. Load and scale the image using the absolute path
+        if os.path.exists(full_image_path):
+            pixmap = QPixmap(full_image_path)
+            scaled_pixmap = pixmap.scaled(
+                180, 180, 
+                Qt.AspectRatioMode.KeepAspectRatio, 
+                Qt.TransformationMode.SmoothTransformation
+            )
+            self.image_label.setPixmap(scaled_pixmap)
+        else:
+            self.image_label.setText(f"Missing\n{image_name}")
+
+    # --- Mouse Dragging & Context Menu ---
     def mousePressEvent(self, event):
         if not self.is_locked and event.button() == Qt.MouseButton.LeftButton:
             self._drag_pos = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
@@ -183,30 +197,24 @@ class DesktopMonitorWidget(QWidget):
         if not self.is_locked and event.buttons() == Qt.MouseButton.LeftButton:
             new_pos = event.globalPosition().toPoint() - self._drag_pos
             self.move(new_pos)
-            self.settings.setValue("pos", new_pos)  # Instantly store coordinates
+            self.settings.setValue("pos", new_pos)
             event.accept()
 
     def keyPressEvent(self, event: QKeyEvent):
         if event.key() == Qt.Key.Key_Escape:
             self.close()
 
-    # --- Context Menu with Position Locking ---
     def show_context_menu(self, position):
         menu = QMenu(self)
-
-        # Toggleable Lock Action
         lock_action = QAction("Lock Position", self)
         lock_action.setCheckable(True)
         lock_action.setChecked(self.is_locked)
         lock_action.triggered.connect(self.toggle_lock)
         menu.addAction(lock_action)
-
         menu.addSeparator()
-
         close_action = QAction("Exit Monitor", self)
         close_action.triggered.connect(self.close)
         menu.addAction(close_action)
-
         menu.exec(self.mapToGlobal(position))
 
     def toggle_lock(self, checked):
@@ -218,7 +226,6 @@ if __name__ == "__main__":
     widget = DesktopMonitorWidget()
     widget.show()
 
-    # Start background listener for 'q'
     listener = TerminalListener()
     listener.quit_signal.connect(app.quit)
     listener.start()
